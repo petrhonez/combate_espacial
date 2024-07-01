@@ -1,0 +1,378 @@
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
+
+// Definições de pinos para os displays de 7 segmentos controlados por 74HC595
+const int latchPin = 4; // Pino conectado ao pino de trava (ST_CP) de 74HC595
+const int clockPin = 3; // Pino conectado ao pino de clock (SH_CP) de 74HC595
+const int dataPin = 2;  // Pino conectado ao pino de data (DS) de 74HC595
+
+#define JOYSTICK_X A2
+#define JOYSTICK_Y A1
+#define JOYSTICK_BTN 9
+
+#define LCD_ADDR 0x27
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
+#define T1_SYMBOL 11
+#define T2_SYMBOL 10
+#define EXPLOSION_SYMBOL 12
+#define SHOT 13
+
+// Digitos do display de 7 segmentos
+int seven_seg_digits[10][4] = { { 0,0,0,0 }, // = 0
+                                { 0,0,0,1 }, // = 1
+                                { 0,0,1,0 }, // = 2
+                                { 0,0,1,1 }, // = 3
+                                { 0,1,0,0 }, // = 4
+                                { 0,1,0,1 }, // = 5
+                                { 0,1,1,0 }, // = 6
+                                { 0,1,1,1 }, // = 7
+                                { 1,0,0,0 }, // = 8
+                                { 1,0,0,1 }  // = 9
+                              };
+
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLUMNS, LCD_ROWS);
+
+byte T1[8] = { B00000, B00000, B00000, B00000, B00100, B01110, B10001, B01110 };
+byte T2[8] = { B00000, B01110, B10101, B11111, B10101, B00000, B00000, B00000 };
+byte EX[8] = { B11111, B10001, B01010, B00000, B01010, B11111, B00000, B00000 };
+byte L[8] = { B00100, B00100, B00100, B00000, B00100, B01110, B10001, B01110 };
+
+const int initialScore = 0;
+
+int score = initialScore;
+int t1Position = 7; // Initial position of T1
+int t2Position = 13; // Initial position of T2
+int t2Direction = -1; // Initial direction of T2
+int countdown = 30; // Countdown timer, starts at 59 seconds
+
+int menuSelection = 0;
+int menu2Selection = 0;
+bool inGame = false;
+
+unsigned long previousScreenUpdateTime = 400;
+unsigned long previousCharacterMoveTime = 0;
+unsigned long previousHuntTime = 0;
+unsigned long previousShotTime = 500; // Tempo da última vez que t1 atirou
+unsigned long previousMenuTime = 0;
+unsigned long previousMenu2Time = 0;
+const long characterMoveInterval = 200; // Intervalo entre os movimentos dos caracteres em milissegundos
+const long shotInterval = 1000; // Intervalo entre os tiros da nave t1 em milissegundos
+
+void setup() {
+    pinMode(A0, INPUT); // Configura o pino A0 como entrada
+    randomSeed(analogRead(A0)); // Inicializa a semente de aleatoriedade com o valor lido do pino A0
+    
+    pinMode(JOYSTICK_BTN, INPUT_PULLUP);
+
+    pinMode(latchPin, OUTPUT);
+    pinMode(dataPin, OUTPUT);
+    pinMode(clockPin, OUTPUT);
+
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+
+    lcd.createChar(T1_SYMBOL, T1);
+    lcd.createChar(T2_SYMBOL, T2);
+    lcd.createChar(EXPLOSION_SYMBOL, EX);
+    lcd.createChar(SHOT, L);
+
+    displayMenu();
+
+    // Mostra "00" nos displays de 7 segmentos
+    disp7SegmWrite(0);
+}
+
+void loop() {
+
+    unsigned long currentMillis = millis();
+    
+    if(!inGame){
+      if (currentMillis - previousMenuTime >= 200){
+        displayMenu();
+        previousMenuTime = currentMillis;
+      }
+      
+      handleMenuInput();
+    }else{
+
+    if (currentMillis - previousScreenUpdateTime >= 500) {
+        atualizarLCD(t1Position);
+        previousScreenUpdateTime = currentMillis;
+    }
+
+    verificarMovimento();
+    moverNaveT2();
+    interacaoNaves();
+
+    // Atualiza o contador regressivo de tempo
+    if (currentMillis - previousShotTime >= 1000) {
+        countdown--;
+        previousShotTime = currentMillis;
+        atualizarTempo(countdown);
+    }
+
+    // Verifica se o tempo acabou
+    if (countdown <= 0) {
+        gameOver();
+    }
+  }
+}
+
+void displayMenu() {
+    lcd.clear();
+    if (menuSelection == 0) {
+        lcd.setCursor(0, 0);
+        lcd.print("> START GAME    ");
+        lcd.setCursor(0, 1);
+        lcd.print("  Credits    ");
+    } else if (menuSelection == 1) {
+        lcd.setCursor(0, 0);
+        lcd.print("  Start Game    ");
+        lcd.setCursor(0, 1);
+        lcd.print("> Credits    ");
+    }
+}
+
+
+void handleMenuInput() {
+    int xValue = analogRead(JOYSTICK_X);
+    if (xValue < 200 && menuSelection > 0) { // Move Left
+        menuSelection--;
+        delay(200); // Button debounce delay
+    } else if (xValue > 800 && menuSelection < 1) { // Move Right
+        menuSelection++;
+        delay(200); // Button debounce delay
+    } else if (digitalRead(JOYSTICK_BTN) == LOW) { // Button press
+        if (menuSelection == 0) {
+            startGame();
+        } else if (menuSelection == 1) {
+            showCredits();
+        }
+        delay(200); // Button debounce delay
+    }
+}
+
+
+void startGame() {
+    lcd.clear();
+    inGame = true;
+}
+
+void showCredits() {
+    lcd.clear();
+    lcd.print("Credits:");
+    lcd.setCursor(0, 1);
+    lcd.print("Developed by");
+    delay(2000);
+    lcd.clear();
+    lcd.print("Luiz Almeida");
+    delay(2000);
+    lcd.clear();
+    lcd.print("Lord John");
+    delay(2000);
+    lcd.clear();
+    lcd.print("Petrhonez");
+    delay(2000);
+}
+
+void verificarMovimento() {
+    unsigned long currentMillis = millis();
+
+    int xValue = analogRead(JOYSTICK_X);
+    if (xValue < 200 || xValue > 800) {
+        if (currentMillis - previousCharacterMoveTime >= characterMoveInterval) {
+            if (xValue < 200) {
+                if (t1Position > 1) {
+                    t1Position--;
+                } else {
+                    t1Position = 12;
+                }
+            } else if (xValue > 800) {
+                if (t1Position < 12) {
+                    t1Position++;
+                } else {
+                    t1Position = 1;
+                }
+            }
+            atualizarLCD(t1Position);
+            previousCharacterMoveTime = currentMillis;
+        }
+    }
+}
+
+void atualizarLCD(int posicao) {
+    lcd.clear();
+    lcd.setCursor(posicao, 1);
+    lcd.write(T1_SYMBOL);
+    lcd.setCursor(t2Position, 0);
+    lcd.write(T2_SYMBOL);
+}
+
+void moverNaveT2() { //aleatorio
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - previousHuntTime >= 500) {
+        // Gera um número aleatório entre 0 e 1
+        int randomDirection = random(0, 2);
+
+        // Move T2 aleatoriamente
+        if (randomDirection == 0) {
+            if (t2Position > 1) {
+                t2Position--;
+            }
+        } else {
+            if (t2Position < 12) {
+                t2Position++;
+            }
+        }
+
+        previousHuntTime = currentMillis;
+    }
+}
+
+void interacaoNaves() {
+    static bool previousButtonState = HIGH; // Estado anterior do botão A
+    bool currentButtonState = digitalRead(JOYSTICK_BTN); // Estado atual do botão A
+
+    // Verifica se o botão A foi pressionado e estava solto anteriormente
+    if (currentButtonState == LOW && previousButtonState == HIGH) {
+        // Se T1 estiver na mesma posição de T2, aumenta o score
+        if (t1Position == t2Position) {
+            lcd.setCursor(t2Position, 0);
+            delay(100);
+            lcd.write(EXPLOSION_SYMBOL);
+            lcd.setCursor(t1Position, 1);
+            lcd.write(SHOT);
+            delay(1000);
+            score++;
+            atualizarScore(score);
+        }
+    }
+
+    // Atualiza o estado anterior do botão A
+    previousButtonState = currentButtonState;
+}
+
+void atualizarTempo(int tempo) {
+    lcd.setCursor(14, 0);
+    if (tempo < 10) {
+        lcd.print("0");
+    }
+    lcd.print(tempo);
+}
+
+void atualizarScore(int pontos) {
+    lcd.setCursor(14, 1);
+    if (pontos < 10){
+      lcd.print("0");
+    }
+    lcd.print(pontos);
+    disp7SegmWrite(pontos);
+}
+
+void gameOver() {
+          
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("GAME OVER");
+    lcd.setCursor(0, 1);
+    lcd.print("Score: ");
+    lcd.print(score);
+    delay(3000);
+
+        // Mostra "00" nos displays de 7 segmentos
+    disp7SegmWrite(0);
+
+    score = initialScore;
+    t1Position = 7;
+    t2Position = 13;
+    t2Direction = -1;
+    countdown = 30;
+    inGame = false;
+
+    }
+/*
+void displayMenu2() {
+    lcd.clear();
+    if (menu2Selection == 0) {
+        lcd.setCursor(0, 0);
+        lcd.print("> Restart    ");
+        lcd.setCursor(0, 1);
+        lcd.print("  Main Menu    ");
+    } else if (menu2Selection == 1) {
+        lcd.setCursor(0, 0);
+        lcd.print("  Restart    ");
+        lcd.setCursor(0, 1);
+        lcd.print("> Main Menu    ");
+    }
+}
+
+
+void handleMenu2() {
+    int xValue = analogRead(JOYSTICK_X);
+    if (xValue < 200 && menu2Selection > 0) { // Move Left
+        menu2Selection--;
+        delay(200); // Button debounce delay
+    } else if (xValue > 800 && menu2Selection < 1) { // Move Right
+        menu2Selection++;
+        delay(200); // Button debounce delay
+    } else if (digitalRead(JOYSTICK_BTN) == LOW) { // Button press
+        if (menu2Selection == 0) {
+            resetGame();
+        } else if (menu2Selection == 1) {
+            backToMainMenu();
+        }
+        delay(200); // Button debounce delay
+    }
+}
+
+void resetGame() {
+    score = initialScore;
+    t1Position = 7;
+    t2Position = 13;
+    t2Direction = -1;
+    countdown = 30;
+    inGame = true;
+    disp7SegmWrite(score);
+}
+
+void backToMainMenu() {
+    score = initialScore;
+    t1Position = 7;
+    t2Position = 13;
+    t2Direction = -1;
+    countdown = 30;
+    inGame = false;
+    disp7SegmWrite(score);
+}
+*/
+
+
+void disp7SegmWrite(int number) {
+    int num1 = 0, num2 = 0;
+    if ((number < 0) || (number > 99)) {
+        number = 0;
+    }
+    num1 = number / 10;
+    num2 = number % 10;
+
+    byte enviarBits = 0;
+    digitalWrite(latchPin, LOW);
+
+    // Escreve num1 (dígito mais significativo)
+    bitWrite(enviarBits, 0, seven_seg_digits[num1][3]);
+    bitWrite(enviarBits, 1, seven_seg_digits[num1][2]);
+    bitWrite(enviarBits, 2, seven_seg_digits[num1][1]);
+    bitWrite(enviarBits, 3, seven_seg_digits[num1][0]);
+
+    // Escreve num2 (dígito menos significativo)
+    bitWrite(enviarBits, 4, seven_seg_digits[num2][3]);
+    bitWrite(enviarBits, 5, seven_seg_digits[num2][2]);
+    bitWrite(enviarBits, 6, seven_seg_digits[num2][1]);
+    bitWrite(enviarBits, 7, seven_seg_digits[num2][0]);
+
+    shiftOut(dataPin, clockPin, MSBFIRST, enviarBits);
+    digitalWrite(latchPin, HIGH);
+}
